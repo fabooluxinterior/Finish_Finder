@@ -11,6 +11,7 @@ from torchvision import models, transforms
 import torch.nn as nn
 import uvicorn
 import gc
+import os
 
 app = FastAPI()
 
@@ -25,11 +26,9 @@ app.add_middleware(
 # 1. Setup Lightweight AI Model (MobileNetV2)
 # ==========================================
 weights = models.MobileNet_V2_Weights.DEFAULT
-# Load MobileNet's feature extractor
 base_model = models.mobilenet_v2(weights=weights).features
 base_model.eval()
 
-# Add pooling to flatten the output into a 1D vector
 pool = nn.AdaptiveAvgPool2d((1, 1))
 model = nn.Sequential(base_model, pool)
 
@@ -43,7 +42,7 @@ preprocess = transforms.Compose([
 def get_image_embedding(image):
     image = image.convert('RGB')
     input_tensor = preprocess(image).unsqueeze(0)
-    with torch.no_grad(): # <--- Fixed with an underscore
+    with torch.no_grad():
         features = model(input_tensor)
     return features.flatten().numpy()
 
@@ -59,25 +58,27 @@ def load_data():
     global df, index, valid_indices
     sheet_url = "https://docs.google.com/spreadsheets/d/1cPJlL8su4dZARXzWVNgBKl1ZUP9Iq-IJuBhWLUBYI7s/export?format=csv&gid=0"
     
-    df = pd.read_csv(sheet_url, skiprows=1).dropna(subset=['Cover image link']).reset_index(drop=True)
+    try:
+        df = pd.read_csv(sheet_url, skiprows=1).dropna(subset=['Cover image link']).reset_index(drop=True)
+        
+        embeddings = []
+        for idx, row in df.iterrows():
+            try:
+                response = requests.get(row['Cover image link'], timeout=5)
+                img = Image.open(BytesIO(response.content))
+                embeddings.append(get_image_embedding(img))
+                valid_indices.append(idx)
+            except:
+                continue
+                
+        if embeddings:
+            embeddings = np.array(embeddings).astype('float32')
+            faiss.normalize_L2(embeddings)
+            index = faiss.IndexFlatIP(embeddings.shape[1])
+            index.add(embeddings)
+    except Exception as e:
+        print(f"Error loading sheet data: {e}")
     
-    embeddings = []
-    for idx, row in df.iterrows():
-        try:
-            response = requests.get(row['Cover image link'], timeout=5)
-            img = Image.open(BytesIO(response.content))
-            embeddings.append(get_image_embedding(img))
-            valid_indices.append(idx)
-        except:
-            continue
-            
-    if embeddings:
-        embeddings = np.array(embeddings).astype('float32')
-        faiss.normalize_L2(embeddings)
-        index = faiss.IndexFlatIP(embeddings.shape[1])
-        index.add(embeddings)
-    
-    # Force memory cleanup after startup
     gc.collect()
 
 # ==========================================
@@ -85,6 +86,9 @@ def load_data():
 # ==========================================
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
+    if index is None or len(valid_indices) == 0:
+        return {"matches": [], "error": "Database is not loaded or empty."}
+
     image_data = await file.read()
     target_image = Image.open(BytesIO(image_data))
     
@@ -92,7 +96,8 @@ async def upload_image(file: UploadFile = File(...)):
     query_vector = np.array([query_vector]).astype('float32')
     faiss.normalize_L2(query_vector)
     
-    distances, match_indices = index.search(query_vector, k=3)
+    k_matches = min(3, len(valid_indices))
+    distances, match_indices = index.search(query_vector, k=k_matches)
     
     results = []
     for rank, match_idx_in_faiss in enumerate(match_indices[0]):
@@ -110,3 +115,7 @@ async def upload_image(file: UploadFile = File(...)):
         })
         
     return {"matches": results}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
