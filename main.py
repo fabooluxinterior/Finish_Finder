@@ -43,7 +43,7 @@ preprocess = transforms.Compose([
 def get_image_embedding(image):
     image = image.convert('RGB')
     input_tensor = preprocess(image).unsqueeze(0)
-    with torch.no.grad():
+    with torch.no_grad(): # <--- Fixed with an underscore
         features = model(input_tensor)
     return features.flatten().numpy()
 
