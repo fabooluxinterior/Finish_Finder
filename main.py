@@ -10,10 +10,10 @@ import torch
 from torchvision import models, transforms
 import torch.nn as nn
 import uvicorn
+import gc
 
 app = FastAPI()
 
-# Allow your HTML frontend on Hugging Face to communicate with this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -22,12 +22,16 @@ app.add_middleware(
 )
 
 # ==========================================
-# 1. Setup AI Model (ResNet50)
+# 1. Setup Lightweight AI Model (MobileNetV2)
 # ==========================================
-weights = models.ResNet50_Weights.DEFAULT
-model = models.resnet50(weights=weights)
-model = nn.Sequential(*list(model.children())[:-1])
-model.eval()
+weights = models.MobileNet_V2_Weights.DEFAULT
+# Load MobileNet's feature extractor
+base_model = models.mobilenet_v2(weights=weights).features
+base_model.eval()
+
+# Add pooling to flatten the output into a 1D vector
+pool = nn.AdaptiveAvgPool2d((1, 1))
+model = nn.Sequential(base_model, pool)
 
 preprocess = transforms.Compose([
     transforms.Resize(256),
@@ -41,7 +45,7 @@ def get_image_embedding(image):
     input_tensor = preprocess(image).unsqueeze(0)
     with torch.no.grad():
         features = model(input_tensor)
-    return features.squeeze().numpy()
+    return features.flatten().numpy()
 
 # ==========================================
 # 2. Load Data & Build Database on Startup
@@ -53,10 +57,8 @@ valid_indices = []
 @app.on_event("startup")
 def load_data():
     global df, index, valid_indices
-    # Direct CSV export link for your Faboolux Google Sheet
     sheet_url = "https://docs.google.com/spreadsheets/d/1cPJlL8su4dZARXzWVNgBKl1ZUP9Iq-IJuBhWLUBYI7s/export?format=csv&gid=0"
     
-    # Read sheet and drop missing images
     df = pd.read_csv(sheet_url, skiprows=1).dropna(subset=['Cover image link']).reset_index(drop=True)
     
     embeddings = []
@@ -67,14 +69,16 @@ def load_data():
             embeddings.append(get_image_embedding(img))
             valid_indices.append(idx)
         except:
-            continue # Skip broken images
+            continue
             
-    # Build FAISS similarity index
     if embeddings:
         embeddings = np.array(embeddings).astype('float32')
         faiss.normalize_L2(embeddings)
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
+    
+    # Force memory cleanup after startup
+    gc.collect()
 
 # ==========================================
 # 3. The API Endpoint for Image Uploads
@@ -84,12 +88,10 @@ async def upload_image(file: UploadFile = File(...)):
     image_data = await file.read()
     target_image = Image.open(BytesIO(image_data))
     
-    # Process uploaded image
     query_vector = get_image_embedding(target_image)
     query_vector = np.array([query_vector]).astype('float32')
     faiss.normalize_L2(query_vector)
     
-    # Find top 3 matches
     distances, match_indices = index.search(query_vector, k=3)
     
     results = []
@@ -108,6 +110,3 @@ async def upload_image(file: UploadFile = File(...)):
         })
         
     return {"matches": results}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
